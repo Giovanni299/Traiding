@@ -4,7 +4,7 @@
 //|                         v7.0 — Pullback Pro + XAUUSD Support     |
 //+------------------------------------------------------------------+
 #property copyright "SessionBias EA"
-#property version   "8.40"
+#property version   "8.60"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -16,7 +16,7 @@ CPositionInfo  posInfo;
 //+------------------------------------------------------------------+
 //| INPUTS                                                           |
 //+------------------------------------------------------------------+
-input double Version = 8.4;
+input double Version = 8.6;
 
 input group "=== GESTIÓN DE RIESGO ==="
 input double   RiskPercent       = 0.5;     // Bajado a 0.5% para controlar el Drawdown 60%
@@ -24,14 +24,17 @@ input double   ATR_Multiplier_SL = 2.5;     // SL más amplio (era 2.0)
 input double   ATR_Multiplier_TP = 5.0;     // RR 1:2 fijo
 input int      ATR_Period        = 14;   
 
-input group "=== GESTIÓN DE POSICIÓN (BREAKEVEN, PARCIAL Y TRAILING) ==="
-input bool   UseBreakEven       = true;     // Activar el BreakEven
-input bool   UsePartialClose    = true;     // Activar toma de ganancias parcial
-input double PartialClose_Pct   = 30.0;     // REDUCIDO: Cerrar solo 30% en el primer impulso
-input double BreakEven_ATR_Mult = 1.5;      // Mover a BE y cerrar parcial a 1.5x ATR
-input int    BreakEven_Padding  = 10;       // Puntos (ticks) extra para cubrir comisiones
-input bool   UseTrailingStop    = true;     // Activar Trailing Stop dinámico posterior al BE
-input double Trailing_ATR_Dist  = 1.5;      // Distancia a la que el Trailing Stop perseguirá al precio
+input group "=== GESTIÓN DE POSICIÓN (ESCALONES DE GANANCIA) ==="
+input bool   UseBreakEven       = true;
+input bool   UsePartialClose    = true;
+input double PartialClose_Pct   = 30.0;     
+input double BreakEven_ATR_Mult = 1.5;      
+input int    BreakEven_Padding  = 10;       
+input bool   UseStepTrailing    = true;     // Nuevo sistema por escalones
+input double Step1_Trigger      = 2.5;      // Cuando el precio alcance 2.5x ATR...
+input double Step1_Lock         = 1.0;      // ...Asegurar 1.0x ATR de ganancia
+input double Step2_Trigger      = 3.5;      // Cuando el precio alcance 3.5x ATR...
+input double Step2_Lock         = 2.0;      // ...Asegurar 2.0x ATR de ganancia
 
 input group "=== FILTROS DE ALTA PROBABILIDAD ==="
 input int      ADX_Min           = 25;      // Solo tendencias fuertes
@@ -264,7 +267,7 @@ void ExecuteTrade(string s, MarketAnalysis &a) {
 }
 
 void ManageBreakEven() {
-   if(!UseBreakEven && !UseTrailingStop) return;
+   if(!UseBreakEven && !UseStepTrailing) return;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--) {
       if(posInfo.SelectByIndex(i) && posInfo.Magic() == 20240001) {
@@ -277,15 +280,18 @@ void ManageBreakEven() {
          long type = posInfo.PositionType();
 
          double atr = GetATR(symbol, PERIOD_M15); 
-         double triggerDistance = atr * BreakEven_ATR_Mult;
-         double trailingDistance = atr * Trailing_ATR_Dist;
+         double beTrigger = atr * BreakEven_ATR_Mult;
+         double step1Trigger = atr * Step1_Trigger;
+         double step1Lock = atr * Step1_Lock;
+         double step2Trigger = atr * Step2_Trigger;
+         double step2Lock = atr * Step2_Lock;
          
          double pTickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
          int dig = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
          if(type == POSITION_TYPE_BUY) {
-            // --- FASE 1: BreakEven y Cierre Parcial ---
-            if(currentPrice >= (entryPrice + triggerDistance) && currentSL < entryPrice) {
+            // --- FASE 1: BreakEven y Cierre Parcial (1.5 ATR) ---
+            if(currentPrice >= (entryPrice + beTrigger) && currentSL < entryPrice) {
                double newSL = NormalizeDouble(entryPrice + (BreakEven_Padding * pTickSize), dig);
                if(trade.PositionModify(ticket, newSL, posInfo.TakeProfit())) {
                   if(UsePartialClose) {
@@ -296,18 +302,23 @@ void ManageBreakEven() {
                   }
                }
             }
-            // --- FASE 2: Trailing Stop (Solo se activa si ya está protegido en BE o superior) ---
-            else if(UseTrailingStop && currentSL >= entryPrice) {
-               double dynamicSL = NormalizeDouble(currentPrice - trailingDistance, dig);
-               // Solo modificamos si el nuevo SL es mayor que el actual (asegurando más ganancia)
-               if(dynamicSL > currentSL + (10 * pTickSize)) {
-                  trade.PositionModify(ticket, dynamicSL, posInfo.TakeProfit());
+            // --- FASE 2: Escalones de Ganancia ---
+            if(UseStepTrailing) {
+               // Escalón 2 (Asegurar 2.0 ATR)
+               if(currentPrice >= (entryPrice + step2Trigger) && currentSL < (entryPrice + step2Lock - (10*pTickSize))) {
+                  double newSL = NormalizeDouble(entryPrice + step2Lock, dig);
+                  trade.PositionModify(ticket, newSL, posInfo.TakeProfit());
+               }
+               // Escalón 1 (Asegurar 1.0 ATR)
+               else if(currentPrice >= (entryPrice + step1Trigger) && currentSL < (entryPrice + step1Lock - (10*pTickSize))) {
+                  double newSL = NormalizeDouble(entryPrice + step1Lock, dig);
+                  trade.PositionModify(ticket, newSL, posInfo.TakeProfit());
                }
             }
          }
          else if(type == POSITION_TYPE_SELL) {
-            // --- FASE 1: BreakEven y Cierre Parcial ---
-            if(currentPrice <= (entryPrice - triggerDistance) && (currentSL > entryPrice || currentSL == 0.0)) {
+            // --- FASE 1: BreakEven y Cierre Parcial (1.5 ATR) ---
+            if(currentPrice <= (entryPrice - beTrigger) && (currentSL > entryPrice || currentSL == 0.0)) {
                double newSL = NormalizeDouble(entryPrice - (BreakEven_Padding * pTickSize), dig);
                if(trade.PositionModify(ticket, newSL, posInfo.TakeProfit())) {
                   if(UsePartialClose) {
@@ -318,12 +329,17 @@ void ManageBreakEven() {
                   }
                }
             }
-            // --- FASE 2: Trailing Stop (Solo se activa si ya está protegido en BE o superior) ---
-            else if(UseTrailingStop && currentSL > 0.0 && currentSL <= entryPrice) {
-               double dynamicSL = NormalizeDouble(currentPrice + trailingDistance, dig);
-               // Solo modificamos si el nuevo SL es menor que el actual (asegurando más ganancia en cortos)
-               if(dynamicSL < currentSL - (10 * pTickSize)) {
-                  trade.PositionModify(ticket, dynamicSL, posInfo.TakeProfit());
+            // --- FASE 2: Escalones de Ganancia ---
+            if(UseStepTrailing) {
+               // Escalón 2 (Asegurar 2.0 ATR)
+               if(currentPrice <= (entryPrice - step2Trigger) && (currentSL > (entryPrice - step2Lock + (10*pTickSize)) || currentSL == 0.0)) {
+                  double newSL = NormalizeDouble(entryPrice - step2Lock, dig);
+                  trade.PositionModify(ticket, newSL, posInfo.TakeProfit());
+               }
+               // Escalón 1 (Asegurar 1.0 ATR)
+               else if(currentPrice <= (entryPrice - step1Trigger) && (currentSL > (entryPrice - step1Lock + (10*pTickSize)) || currentSL == 0.0)) {
+                  double newSL = NormalizeDouble(entryPrice - step1Lock, dig);
+                  trade.PositionModify(ticket, newSL, posInfo.TakeProfit());
                }
             }
          }
