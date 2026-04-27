@@ -1,8 +1,7 @@
 //+------------------------------------------------------------------+
-//|                                         SessionBias_EURUSD.mq5  |
-//|                         Multi-TF Trend + Pullback — EURUSD only  |
-//|                         v1.2 — revert H1 confirm | PF 1.51 base  |
-//|                                Sharpe 14.81 | DD 11.6% | WR 54%  |
+//|                                          SessionBias_XAUUSD.mq5  |
+//|              Multi-TF Trend + Session Breakout — Gold Only       |
+//|              v2.0 — breakout de sesión vs pullback M15 fallido   |
 //+------------------------------------------------------------------+
 //
 //  VENTANA DE OPERACIÓN (solo días hábiles):
@@ -10,19 +9,26 @@
 //    UTC / GMT   →  13:00 – 16:59   Cierre forzado: 17:00 UTC
 //    UTC-5 (EST) →  08:00 – 11:59   Cierre forzado: 12:00 EST
 //
-//  Cubre la apertura de Nueva York + overlap Londres-NY:
-//  la ventana de mayor volumen y tendencia en EUR/USD.
-//  Evita la sesión asiática (movimientos sin dirección en EUR).
+//  Mismo overlap Londres-NY que EURUSD — las 3 horas de mayor volumen.
 //
-//  HISTORIAL DE VERSIONES:
-//  v1.0 — baseline: PF 1.51, Sharpe 14.81, WR 54%, DD 11.6%
-//  v1.1 — DESCARTADO: filtro dirección vela H1 (PF cayó a 0.90)
-//         Error: estrategia pullback entra cuando H1 aún baja —
-//         exigir H1 alcista elimina los mejores setups.
-//  v1.2 — revert a v1.0, UseH1CandleConfirm=false mantenido como opción
+//  POR QUÉ BREAKOUT Y NO PULLBACK PARA EL ORO:
+//  v1.0 usó pullback M15 (mismo enfoque que EURUSD): PF 0.83, -$1,673
+//  El oro NO hace pullbacks ordenados en M15. Consolida durante horas
+//  y luego ROMPE con una vela grande. El patrón es:
+//    1. Tendencia macro alcista (D1 > EMA50, H4 > EMA200)
+//    2. Consolidación en rango estrecho durante N velas
+//    3. Ruptura: M15 cierra por encima del máximo de las últimas N velas
+//    4. Ese breakout confirma la reanudación del trend → entrar
+//  Este patrón captura las explosiones del oro que generan los grandes
+//  movimientos. Con pullback, se entra demasiado pronto o en ruido.
+//
+//  HISTORIAL:
+//  v1.0 — pullback M15 + EMA21: PF 0.83, WR 37%, -$1,673 (descartado)
+//         171 trades = demasiados. El M15 es muy ruidoso para oro.
+//  v2.0 — breakout de sesión: breakout de N velas + filtros macro
 //
 #property copyright "SessionBias EA"
-#property version   "1.2"
+#property version   "2.0"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -34,84 +40,83 @@ CPositionInfo posInfo;
 //+------------------------------------------------------------------+
 //| INPUTS                                                           |
 //+------------------------------------------------------------------+
-input double Version = 1.2;
+input double Version = 2.0;
+
 input group "=== RIESGO ==="
-input double RiskPercent      = 1.0;   // % del balance por trade
-input double ATR_SL_Mult      = 1.2;   // SL = ATR × este valor
-input double ATR_TP_Mult      = 2.5;   // TP = ATR × este valor
+input double RiskPercent    = 1.0;
+input double ATR_SL_Mult    = 1.5;   // SL debajo del breakout level + ATR buffer
+input double ATR_TP_Mult    = 2.5;   // TP alcanzable dentro de la sesión (3.0 era demasiado)
 
 input group "=== GESTIÓN DE POSICIÓN ==="
-input bool   UseBreakEven     = true;
-input double BE_TriggerMult   = 1.5;   // Activar BE cuando precio avanza 1.5×ATR
-input double BE_LockMult      = 0.5;   // SL se mueve a entrada + 0.5×ATR
+input bool   UseBreakEven   = true;
+input double BE_TriggerMult = 1.5;   // Bajado de 2.0 — el TP también bajó a 2.5
+input double BE_LockMult    = 0.7;   // Lock-in intermedio para oro
 
 input group "=== PROTECCIÓN DIARIA ==="
 input bool   UseDailyLossLimit = true;
-input double MaxDailyLossPct   = 2.0;  // Detiene trading si el día pierde > 2% balance
+input double MaxDailyLossPct   = 2.0;
 
 input group "=== CIRCUIT BREAKER ==="
-input bool   UseCircuitBreaker  = true;
-input int    MaxConsecLosses    = 4;
+input bool   UseCircuitBreaker   = true;
+input int    MaxConsecLosses     = 3;
 input int    CircuitBreakerHours = 48;
 
 input group "=== CIERRE POR TIEMPO ==="
-input bool   UseForceClose   = true;
-input int    ForceCloseHour  = 17;     // Cierre forzado GMT (sesión Londres cierra)
+input bool   UseForceClose    = true;
+input int    ForceCloseHour   = 17;
 input int    ForceCloseMinute = 0;
 
 input group "=== FILTROS DE TENDENCIA ==="
-input int    ADX_H4_Min      = 28;     // ADX en H4 mínimo para operar
-input int    ADX_D1_Min      = 17;     // ADX en D1 mínimo (filtra mercados en rango)
+input int    ADX_H4_Min      = 28;    // Subido de 25 → 28, igual que EURUSD
+input int    ADX_D1_Min      = 20;
 input bool   UseADX_D1Filter = true;
-input bool   UseStrictEMA    = true;   // EMA21 > EMA50 en H1 para confirmar dirección
-// UseH1CandleConfirm=false (v1.1 lo activó y PF cayó de 1.51 a 0.90)
-// Razón: estrategia pullback — la mejor entrada ocurre cuando H1 AÚN baja
-// (el pullback activo). Exigir H1 alcista elimina esos setups y deja solo
-// las entradas tardías de momentum, que tienen peor RR.
-// Mantener como opción desactivada para referencia futura.
-input bool   UseH1CandleConfirm = false;
-input double MinBodyPct      = 0.6;    // Cuerpo mínimo de la vela gatillo (60% del rango)
+input bool   UseStrictEMA    = true;  // EMA21 > EMA50 en H1
+
+input group "=== BREAKOUT ENTRY ==="
+// El oro consolida y rompe — no pullea ordenadamente como EURUSD en M15
+// Entry: M15 cierra por encima del máximo de las últimas N velas (breakout)
+// Confirma que el precio salió del rango y retoma la tendencia macro
+input int    BreakoutPeriod  = 10;   // Mirar los últimos 10 M15 (2.5 horas de consolidación)
+input double MinBreakoutATR  = 0.3;  // Breakout mínimo de 0.3×ATR sobre el máximo (evita falsas rupturas)
 
 input group "=== FILTROS DE MOMENTUM ==="
-input bool   UseRSIFilter    = true;
+input bool   UseRSIFilter   = true;
 input int    RSI_Period      = 14;
-input int    RSI_Overbought  = 70;     // No comprar si RSI > 70
-input int    RSI_Oversold    = 30;     // No vender si RSI < 30
+input int    RSI_Overbought  = 72;
+input int    RSI_Oversold    = 28;
 
 input group "=== FILTROS DE SEGURIDAD ==="
-input int    MinCandlesWait  = 8;      // Cooldown mínimo entre trades (en velas M15)
-input double VolumeFilterMult = 1.1;   // Vela gatillo debe ser 1.1× el cuerpo promedio
-input int    MaxSpreadPoints  = 30;    // Spread máximo permitido (3 pips en 5 dígitos)
+input int    MinCandlesWait  = 8;
+input int    MaxSpreadPoints = 50;
 
 //+------------------------------------------------------------------+
 //| VARIABLES GLOBALES                                               |
 //+------------------------------------------------------------------+
-datetime g_lastBarTime   = 0;
-datetime g_lastTradeTime = 0;
-
+datetime g_lastBarTime        = 0;
+datetime g_lastTradeTime      = 0;
 int      g_consecLosses       = 0;
 datetime g_circuitBreakerUntil = 0;
 ulong    g_lastProcessedDeal  = 0;
-
-double   g_dayStartBalance = 0;
-datetime g_currentDay      = 0;
+double   g_dayStartBalance    = 0;
+datetime g_currentDay         = 0;
 
 //+------------------------------------------------------------------+
 //| INICIALIZACIÓN                                                    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   if(_Symbol != "EURUSD-T" && _Symbol != "EURUSDm" && _Symbol != "EURUSD")
-      Print("⚠️ EA diseñado para EURUSD — símbolo actual: ", _Symbol);
+   string sym = _Symbol;
+   if(StringFind(sym, "XAU") < 0 && StringFind(sym, "GOLD") < 0)
+      Print("⚠️ EA diseñado para XAUUSD — símbolo actual: ", sym);
 
-   trade.SetExpertMagicNumber(20250001);
+   trade.SetExpertMagicNumber(20250002);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
 
    g_dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_currentDay      = StringToTime(TimeToString(TimeGMT(), TIME_DATE));
 
-   Print("✅ SessionBias EURUSD v1.2 — símbolo: ", _Symbol,
-         " | riesgo ", RiskPercent, "% | 13-17h UTC / 08-12h EST");
+   Print("✅ SessionBias XAUUSD v2.0 — símbolo: ", sym,
+         " | riesgo ", RiskPercent, "% | 13-17h UTC / 08-12h EST | breakout ", BreakoutPeriod, " velas");
    return INIT_SUCCEEDED;
 }
 
@@ -122,7 +127,6 @@ void OnTick()
 {
    if(UseForceClose) CloseAtSessionEnd();
 
-   // Resetear balance de referencia al cambiar de día GMT
    datetime today = StringToTime(TimeToString(TimeGMT(), TIME_DATE));
    if(today > g_currentDay)
    {
@@ -147,7 +151,7 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| CIRCUIT BREAKER — detectar pérdidas                              |
+//| CIRCUIT BREAKER                                                  |
 //+------------------------------------------------------------------+
 void OnTrade()
 {
@@ -163,11 +167,10 @@ void OnTrade()
       if(ticket <= g_lastProcessedDeal) break;
       if(ticket > maxTicket) maxTicket = ticket;
 
-      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != 20250001)       continue;
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != 20250002)       continue;
       if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
 
       double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
-
       if(profit < 0.0)
       {
          g_consecLosses++;
@@ -180,9 +183,7 @@ void OnTrade()
          }
       }
       else
-      {
          g_consecLosses = 0;
-      }
    }
 
    if(maxTicket > g_lastProcessedDeal)
@@ -190,13 +191,13 @@ void OnTrade()
 }
 
 //+------------------------------------------------------------------+
-//| SEÑAL DE ENTRADA — retorna +1 (buy), -1 (sell), 0 (nada)        |
+//| SEÑAL: +1 buy, -1 sell, 0 sin señal                             |
 //+------------------------------------------------------------------+
 int GetSignal()
 {
-   // 1. TENDENCIA MACRO: H4 vs EMA200 + vela D1 + EMA50 D1
+   // 1. TENDENCIA MACRO — D1 + H4 + EMA50 D1
    double closeD1  = iClose(_Symbol, PERIOD_D1, 0);
-   double openD1   = iOpen(_Symbol,  PERIOD_D1, 0);
+   double openD1   = iOpen( _Symbol, PERIOD_D1, 0);
    double ema200H4 = GetEMA(PERIOD_H4, 200);
    double ema50D1  = GetEMA(PERIOD_D1, 50);
    double closeH4  = iClose(_Symbol, PERIOD_H4, 1);
@@ -222,39 +223,35 @@ int GetSignal()
       if(trendDown && ema21H1 >= ema50H1) return 0;
    }
 
-   // 3b. CONFIRMACIÓN VELA H1 — la vela H1 anterior debe cerrar en la dirección del trade
-   // Completa la cadena D1→H4→H1→M15: sin este filtro se entra en M15 alcista
-   // mientras H1 aún está bajando (pullback no terminado → SL inmediato)
-   if(UseH1CandleConfirm)
-   {
-      double h1Close = iClose(_Symbol, PERIOD_H1, 1);
-      double h1Open  = iOpen( _Symbol, PERIOD_H1, 1);
-      if(trendUp   && h1Close <= h1Open) return 0;
-      if(trendDown && h1Close >= h1Open) return 0;
-   }
-
-   // 4. ADX H4 — fuerza de tendencia
+   // 4. ADX H4 y D1
    if(GetADX(PERIOD_H4) < ADX_H4_Min) return 0;
-
-   // 4b. ADX D1 — filtro de rango macro
    if(UseADX_D1Filter && GetADX(PERIOD_D1) < ADX_D1_Min) return 0;
 
-   // 5. VELA GATILLO EN M15
+   // 5. BREAKOUT DE SESIÓN EN M15
+   // El oro no pullea ordenadamente: consolida N velas y luego ROMPE
+   // Entry: última vela M15 cerró por encima del máximo de las N velas previas (buy)
+   //        o por debajo del mínimo de las N velas previas (sell)
+   // Esto confirma que el precio salió del rango y retoma la tendencia macro
+   int   lookback = BreakoutPeriod + 2;
    MqlRates r[]; ArraySetAsSeries(r, true);
-   if(CopyRates(_Symbol, PERIOD_M15, 0, 15, r) < 15) return 0;
+   if(CopyRates(_Symbol, PERIOD_M15, 0, lookback, r) < lookback) return 0;
 
-   double body  = MathAbs(r[1].close - r[1].open);
-   double range = r[1].high - r[1].low;
-   if(range > 0 && body / range < MinBodyPct) return 0;
+   double atr = GetATR(PERIOD_M15);
+   double minBreak = atr * MinBreakoutATR;
 
-   // Cuerpo de la vela gatillo vs promedio de 10 velas previas
-   double avgBody = 0;
-   for(int j = 2; j < 12; j++) avgBody += MathAbs(r[j].close - r[j].open);
-   avgBody /= 10.0;
-   if(body < avgBody * VolumeFilterMult) return 0;
+   // Calcular máximo y mínimo de las N velas anteriores a la vela de señal (r[1])
+   double highN = r[2].high, lowN = r[2].low;
+   for(int j = 2; j <= BreakoutPeriod; j++)
+   {
+      if(r[j].high > highN) highN = r[j].high;
+      if(r[j].low  < lowN)  lowN  = r[j].low;
+   }
 
-   if(trendUp   && r[1].close > r[1].open) return  1;
-   if(trendDown && r[1].close < r[1].open) return -1;
+   bool breakoutUp   = trendUp   && (r[1].close > highN + minBreak) && (r[1].close > r[1].open);
+   bool breakoutDown = trendDown && (r[1].close < lowN  - minBreak) && (r[1].close < r[1].open);
+
+   if(breakoutUp)   return  1;
+   if(breakoutDown) return -1;
    return 0;
 }
 
@@ -263,12 +260,12 @@ int GetSignal()
 //+------------------------------------------------------------------+
 void ExecuteTrade(int signal)
 {
-   double atr      = GetATR(PERIOD_M15);
-   double price    = (signal > 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-                                  : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   int    dig      = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   double sl       = NormalizeDouble(price - signal * atr * ATR_SL_Mult, dig);
-   double tp       = NormalizeDouble(price + signal * atr * ATR_TP_Mult, dig);
+   double atr     = GetATR(PERIOD_M15);
+   double price   = (signal > 0) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                                 : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int    dig     = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double sl      = NormalizeDouble(price - signal * atr * ATR_SL_Mult, dig);
+   double tp      = NormalizeDouble(price + signal * atr * ATR_TP_Mult, dig);
 
    double riskUSD  = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
    double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
@@ -283,8 +280,13 @@ void ExecuteTrade(int signal)
    lots = MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN),
           MathMin(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX), lots));
 
-   bool ok = (signal > 0) ? trade.Buy( lots, _Symbol, price, sl, tp, "SB_EUR_v1")
-                          : trade.Sell(lots, _Symbol, price, sl, tp, "SB_EUR_v1");
+   bool ok = (signal > 0) ? trade.Buy( lots, _Symbol, price, sl, tp, "SB_XAU_v2")
+                          : trade.Sell(lots, _Symbol, price, sl, tp, "SB_XAU_v2");
+
+   if(ok)
+      Print("📈 Trade abierto: ", (signal > 0 ? "BUY" : "SELL"),
+            " lots=", lots, " SL=", sl, " TP=", tp,
+            " ATR=", NormalizeDouble(atr, dig));
 
    if(ok) g_lastTradeTime = TimeCurrent();
 }
@@ -298,16 +300,16 @@ void ManageBreakEven()
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(!posInfo.SelectByIndex(i) || posInfo.Magic() != 20250001) continue;
+      if(!posInfo.SelectByIndex(i) || posInfo.Magic() != 20250002) continue;
 
-      double entry  = posInfo.PriceOpen();
-      double curSL  = posInfo.StopLoss();
-      double curPx  = posInfo.PriceCurrent();
-      double atr    = GetATR(PERIOD_M15);
-      double trigger = atr * BE_TriggerMult;
+      double entry    = posInfo.PriceOpen();
+      double curSL    = posInfo.StopLoss();
+      double curPx    = posInfo.PriceCurrent();
+      double atr      = GetATR(PERIOD_M15);
+      double trigger  = atr * BE_TriggerMult;
       double lockDist = atr * BE_LockMult;
-      int    dig    = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-      ulong  ticket = posInfo.Ticket();
+      int    dig      = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+      ulong  ticket   = posInfo.Ticket();
 
       if(posInfo.PositionType() == POSITION_TYPE_BUY)
       {
@@ -325,7 +327,7 @@ void ManageBreakEven()
 }
 
 //+------------------------------------------------------------------+
-//| CIERRE FORZADO AL FIN DE SESIÓN                                  |
+//| CIERRE FORZADO                                                   |
 //+------------------------------------------------------------------+
 void CloseAtSessionEnd()
 {
@@ -334,10 +336,10 @@ void CloseAtSessionEnd()
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(!posInfo.SelectByIndex(i) || posInfo.Magic() != 20250001) continue;
+      if(!posInfo.SelectByIndex(i) || posInfo.Magic() != 20250002) continue;
       ulong ticket = posInfo.Ticket();
       if(trade.PositionClose(ticket))
-         Print("🕔 Cierre sesión: P&L=", NormalizeDouble(posInfo.Profit(), 2));
+         Print("🕔 Cierre sesión XAU: P&L=", NormalizeDouble(posInfo.Profit(), 2));
    }
 }
 
@@ -347,6 +349,7 @@ void CloseAtSessionEnd()
 bool IsTradingTime()
 {
    MqlDateTime dt; TimeToStruct(TimeGMT(), dt);
+   // v2.0: misma ventana que EURUSD — el overlap NY es el período de mayor dirección
    return (dt.hour >= 13 && dt.hour < 17);
 }
 
@@ -358,7 +361,7 @@ bool IsSpreadOk()
 bool HasPosition()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
-      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == 20250001)
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == 20250002)
          return true;
    return false;
 }
@@ -372,7 +375,7 @@ bool IsDailyLossExceeded()
       static datetime lastWarn = 0;
       if(TimeCurrent() - lastWarn > 3600)
       {
-         Print("🛑 Daily loss limit: -$", NormalizeDouble(loss, 2), " — sin entradas hoy");
+         Print("🛑 Daily loss limit XAU: -$", NormalizeDouble(loss, 2), " — sin entradas hoy");
          lastWarn = TimeCurrent();
       }
       return true;
